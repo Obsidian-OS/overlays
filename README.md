@@ -15,12 +15,12 @@ A Rust library designed to provide a file system overlay mechanism by intercepti
 
 ## Configuration
 
-The library's overlay configuration is loaded from `/etc/obsidianos-overlays.conf`. This file should list overlay paths, with one path per line. Lines beginning with `#` are treated as comments, and empty lines are ignored.
+The library's overlay configuration is loaded from `/etc/obsidianos-overlays.conf`. This file should list overlay paths, with one path per line. Anything after `#` is treated as a comment, and empty lines are ignored and if the file doesn't exist it will assume "no overlays".
 
 Example `/etc/obsidianos-overlays.conf`:
 
 ```
-/path/to/overlay1
+/path/to/overlay1 # my overlay
 /path/to/another/overlay
 # This is a comment
 ```

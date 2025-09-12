@@ -35,8 +35,12 @@ fn load_config() -> Vec<String> {
     let result = match fs::read_to_string("/etc/obsidianos-overlays.conf") {
         Ok(content) => content
             .lines()
-            .map(|line| line.trim())
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                line.split_once('#')
+                    .map_or(line, |(before_comment, _)| before_comment)
+                    .trim()
+            })
+            .filter(|line| !line.is_empty())
             .map(String::from)
             .collect(),
         Err(_) => Vec::new(),
