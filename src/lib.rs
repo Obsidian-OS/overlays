@@ -4,6 +4,13 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use libc::{c_char, c_int, mode_t, size_t, ssize_t, FILE};
+use std::env;
+static VERBOSE_MODE: OnceLock<bool> = OnceLock::new();
+fn is_verbose_mode_enabled() -> bool {
+    *VERBOSE_MODE.get_or_init(|| {
+        env::var("OBSIDIANOS_OVERLAYS_VERBOSE").map_or(false, |v| v == "1")
+    })
+}
 static CONFIG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static ORIG_FUNCS: OnceLock<OriginalFunctions> = OnceLock::new();
 static INIT_GUARD: AtomicBool = AtomicBool::new(false);
@@ -96,6 +103,9 @@ fn find_overlay_path(path: &str) -> Option<String> {
     for overlay in overlays {
         let overlay_path = format!("{}{}", overlay, path);
         if Path::new(&overlay_path).exists() {
+            if is_verbose_mode_enabled() {
+                eprintln!("[*] ObsidianOS Overlays: {} -> {}", path, overlay_path);
+            }
             return Some(overlay_path);
         }
     }

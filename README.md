@@ -38,6 +38,22 @@ To utilize this library, compile it and then set the `LD_PRELOAD` environment va
 LD_PRELOAD=/path/to/target/release/libobsidianos_overlays.so your_application
 ```
 
+### Verbose Mode
+
+To enable verbose output, set the `OBSIDIANOS_OVERLAYS_VERBOSE` environment variable to `1`. When enabled, the library will print messages to `stderr` whenever an overlay is successfully applied, showing the original path and the overlaid path.
+
+Example:
+
+```bash
+OBSIDIANOS_OVERLAYS_VERBOSE=1 LD_PRELOAD=/path/to/target/release/libobsidianos_overlays.so your_application
+```
+
+Example verbose output:
+
+```
+[*] ObsidianOS Overlays: /usr/bin/foo -> /path/to/overlay1/usr/bin/foo
+```
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
