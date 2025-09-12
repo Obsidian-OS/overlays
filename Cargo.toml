@@ -1,0 +1,17 @@
+[package]
+name = "obsidianos-overlays"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.175"
+
+[lib]
+name = "obsidianos_overlays"
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
