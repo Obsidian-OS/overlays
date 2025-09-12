@@ -6,11 +6,18 @@ A Rust library designed to provide a file system overlay mechanism by intercepti
 
 ## Features
 
-- **File Operations Interception:** Intercepts `open`, `open64`, `openat`, `openat64`, `fopen`, and `fopen64` for file opening operations.
-- **File Status Interception:** Intercepts `stat`, `lstat`, `stat64`, and `lstat64` for retrieving file status information.
-- **Access Control Interception:** Intercepts `access` and `faccessat` for file access checks.
-- **Symbolic Link Interception:** Intercepts `readlink` and `readlinkat` for reading symbolic links.
-- **Execution Interception:** Intercepts `execve`, `execvp`, and `execv` for program execution.
+- **Comprehensive Filesystem Interception:** Intercepts a wide range of filesystem-related system calls for redirection and overlaying. This includes:
+    - **File Opening:** `open`, `open64`, `openat`, `openat64`, `fopen`, `fopen64`, `creat`, `creat64`
+    - **File Status:** `stat`, `lstat`, `stat64`, `lstat64`
+    - **Access Control:** `access`, `faccessat`
+    - **Symbolic Links:** `readlink`, `readlinkat`, `symlink`, `symlinkat`, `link`, `linkat`
+    - **Execution:** `execve`, `execvp`, `execv`
+    - **Directory Operations:** `unlink`, `unlinkat`, `rmdir`, `mkdir`, `mkdirat`, `rename`, `renameat`, `chdir`, `opendir`, `readdir`, `readdir64`, `closedir`
+    - **Permissions/Ownership:** `chmod`, `fchmodat`, `chown`, `fchownat`, `lchown`
+    - **File Truncation:** `truncate`
+
+- **Directory Merging for `ls` and similar tools:** When `opendir` and `readdir` are intercepted, the library merges the contents of the original directory with its corresponding overlay directory. This means tools like `ls` will display files from both the original location and the overlay, with overlayed files taking precedence (shadowing original files with the same name).
+
 - **Configurable Overlays:** Overlay paths are configured via `/etc/obsidianos-overlays.conf`.
 
 ## Configuration
