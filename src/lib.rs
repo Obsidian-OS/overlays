@@ -284,20 +284,20 @@ fn find_overlay_path(path: &str) -> Option<String> {
     let overlays = get_overlays();
     for overlay in overlays {
         let overlay_path = format!("{}{}", overlay, path);
-        let path_exists = OVERLAY_DISABLED.with(|disabled| {
+        let is_file = OVERLAY_DISABLED.with(|disabled| {
             *disabled.borrow_mut() = true;
-            let exists = Path::new(&overlay_path).exists();
+            let is_file = Path::new(&overlay_path).is_file();
             *disabled.borrow_mut() = false;
-            exists
+            is_file
         });
 
         if is_verbose_mode_enabled() {
             eprintln!(
-                "[DEBUG] Checking overlay_path: {} exists: {}",
-                overlay_path, path_exists
+                "[DEBUG] Checking overlay_path: {} is_file: {}",
+                overlay_path, is_file
             );
         }
-        if path_exists {
+        if is_file {
             if is_verbose_mode_enabled() {
                 eprintln!("[*] ObsidianOS Overlays: {} -> {}", path, overlay_path);
             }
