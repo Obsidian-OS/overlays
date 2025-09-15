@@ -251,7 +251,7 @@ pub unsafe extern "C" fn statx(
 
     let original_functions = get_original_functions();
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             if let Some(original_statx) = original_functions.statx {
                 return unsafe {
@@ -438,7 +438,7 @@ pub unsafe extern "C" fn fopen64(pathname: *const c_char, mode: *const c_char) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().stat)(overlay_cstr.as_ptr(), statbuf) };
         }
@@ -449,7 +449,7 @@ pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut libc::stat)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().lstat)(overlay_cstr.as_ptr(), statbuf) };
         }
@@ -460,7 +460,7 @@ pub unsafe extern "C" fn lstat(pathname: *const c_char, statbuf: *mut libc::stat
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().stat64)(overlay_cstr.as_ptr(), statbuf) };
         }
@@ -471,7 +471,7 @@ pub unsafe extern "C" fn stat64(pathname: *const c_char, statbuf: *mut libc::sta
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().lstat64)(overlay_cstr.as_ptr(), statbuf) };
         }
@@ -482,7 +482,7 @@ pub unsafe extern "C" fn lstat64(pathname: *const c_char, statbuf: *mut libc::st
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(pathname: *const c_char, mode: c_int) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str) {
+        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().access)(overlay_cstr.as_ptr(), mode) };
         }
