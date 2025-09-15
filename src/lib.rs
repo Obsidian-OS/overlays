@@ -61,6 +61,7 @@ struct OriginalFunctions {
     fopen64: unsafe extern "C" fn(*const c_char, *const c_char) -> *mut FILE,
     stat: unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int,
     lstat: unsafe extern "C" fn(*const c_char, *mut libc::stat) -> c_int,
+    fstatat: unsafe extern "C" fn(c_int, *const c_char, *mut libc::stat, c_int) -> c_int,
     stat64: unsafe extern "C" fn(*const c_char, *mut libc::stat64) -> c_int,
     lstat64: unsafe extern "C" fn(*const c_char, *mut libc::stat64) -> c_int,
     access: unsafe extern "C" fn(*const c_char, c_int) -> c_int,
@@ -187,6 +188,7 @@ fn get_original_functions() -> &'static OriginalFunctions {
             fopen64: std::mem::transmute(dlsym("fopen64")),
             stat: std::mem::transmute(stat_ptr),
             lstat: std::mem::transmute(dlsym("lstat")),
+            fstatat: std::mem::transmute(dlsym("fstatat")),
             stat64: std::mem::transmute(dlsym("stat64")),
             lstat64: std::mem::transmute(dlsym("lstat64")),
             access: std::mem::transmute(dlsym("access")),
@@ -610,6 +612,26 @@ pub unsafe extern "C" fn lstat64(pathname: *const c_char, statbuf: *mut libc::st
         }
         return original_result;
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fstatat(
+    dirfd: c_int,
+    pathname: *const c_char,
+    statbuf: *mut libc::stat,
+    flags: c_int,
+) -> c_int {
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                return unsafe {
+                    (get_original_functions().fstatat)(dirfd, overlay_cstr.as_ptr(), statbuf, flags)
+                };
+            }
+        }
+    }
+    unsafe { (get_original_functions().fstatat)(dirfd, pathname, statbuf, flags) }
 }
 
 #[unsafe(no_mangle)]
