@@ -27,7 +27,7 @@ unsafe impl Send for DirPointer {}
 unsafe impl Sync for DirPointer {}
 struct OverlayDir {
     original_dir_ptr: *mut libc::DIR,
-    overlay_dir_ptr: Option<*mut libc::DIR>,
+    overlay_dir_ptrs: Vec<*mut libc::DIR>,
     seen_original_entries: HashSet<String>,
 }
 
@@ -300,6 +300,37 @@ fn find_overlay_path(path: &str) -> Option<String> {
         if is_file {
             if is_verbose_mode_enabled() {
                 eprintln!("[*] ObsidianOS Overlays: {} -> {}", path, overlay_path);
+            }
+            return Some(overlay_path);
+        }
+    }
+    None
+}
+
+fn find_overlay_dir(path: &str) -> Option<String> {
+    if path.starts_with("/etc/obsidianos-overlays.conf") {
+        return None;
+    }
+
+    let overlays = get_overlays();
+    for overlay in overlays {
+        let overlay_path = format!("{}{}", overlay, path);
+        let is_dir = OVERLAY_DISABLED.with(|disabled| {
+            *disabled.borrow_mut() = true;
+            let is_dir = Path::new(&overlay_path).is_dir();
+            *disabled.borrow_mut() = false;
+            is_dir
+        });
+
+        if is_verbose_mode_enabled() {
+            eprintln!(
+                "[DEBUG] Checking overlay_dir: {} is_dir: {}",
+                overlay_path, is_dir
+            );
+        }
+        if is_dir {
+            if is_verbose_mode_enabled() {
+                eprintln!("[*] ObsidianOS Overlays: dir {} -> {}", path, overlay_path);
             }
             return Some(overlay_path);
         }
@@ -907,25 +938,32 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut libc::DIR {
     };
 
     let original_dir_ptr = unsafe { (get_original_functions().opendir)(name) };
-    let overlay_path_opt = find_overlay_path(&path_str);
-    let overlay_dir_ptr = if let Some(overlay_path) = overlay_path_opt {
-        let overlay_cstr = CString::new(overlay_path).unwrap();
-        unsafe { (get_original_functions().opendir)(overlay_cstr.as_ptr()) }
-    } else {
-        std::ptr::null_mut()
-    };
+    let mut overlay_dir_ptrs = Vec::new();
+    let overlays = get_overlays();
+    for overlay in overlays {
+        let overlay_path = format!("{}{}", overlay, path_str);
+        let is_dir = OVERLAY_DISABLED.with(|disabled| {
+            *disabled.borrow_mut() = true;
+            let is_dir = Path::new(&overlay_path).is_dir();
+            *disabled.borrow_mut() = false;
+            is_dir
+        });
+        if is_dir {
+            let overlay_cstr = CString::new(overlay_path).unwrap();
+            let ptr = unsafe { (get_original_functions().opendir)(overlay_cstr.as_ptr()) };
+            if !ptr.is_null() {
+                overlay_dir_ptrs.push(ptr);
+            }
+        }
+    }
 
-    if original_dir_ptr.is_null() && overlay_dir_ptr.is_null() {
+    if original_dir_ptr.is_null() && overlay_dir_ptrs.is_empty() {
         return std::ptr::null_mut();
     }
 
     let overlay_dir = OverlayDir {
         original_dir_ptr,
-        overlay_dir_ptr: if overlay_dir_ptr.is_null() {
-            None
-        } else {
-            Some(overlay_dir_ptr)
-        },
+        overlay_dir_ptrs,
         seen_original_entries: HashSet::new(),
     };
 
@@ -937,14 +975,14 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut libc::DIR {
     get_overlay_dir_map()
         .lock()
         .unwrap()
-        .insert(DirPointer(overlay_dir_ptr_raw as *mut libc::DIR), unsafe {
+        .insert(DirPointer(original_dir_ptr), unsafe {
             Box::from_raw(overlay_dir_ptr_raw)
         });
     if is_verbose_mode_enabled() {
         eprintln!("[DEBUG] opendir: OVERLAY_DIR_MAP lock acquired and released.");
     }
 
-    overlay_dir_ptr_raw as *mut libc::DIR
+    original_dir_ptr
 }
 
 #[unsafe(no_mangle)]
@@ -959,14 +997,14 @@ pub unsafe extern "C" fn readdir(dirp: *mut libc::DIR) -> *mut libc::dirent {
     let overlay_dir_opt = map.get_mut(&DirPointer(dirp));
     if let Some(overlay_dir) = overlay_dir_opt {
         loop {
-            if let Some(overlay_ptr) = overlay_dir.overlay_dir_ptr {
-                let overlay_dirent_ptr = unsafe { (get_original_functions().readdir)(overlay_ptr) };
+            for overlay_ptr in &overlay_dir.overlay_dir_ptrs {
+                let overlay_dirent_ptr = unsafe { (get_original_functions().readdir)(*overlay_ptr) };
                 if !overlay_dirent_ptr.is_null() {
                     let overlay_dirent = unsafe { *overlay_dirent_ptr };
                     let d_name_cstr = unsafe { CStr::from_ptr(overlay_dirent.d_name.as_ptr()) };
                     let d_name_str = d_name_cstr.to_string_lossy().into_owned();
                     if d_name_str != "." && d_name_str != ".." {
-                        overlay_dir.seen_original_entries.insert(d_name_str);
+                        overlay_dir.seen_original_entries.insert(d_name_str.clone());
                         return DIRENT_BUFFER.with(|cell| {
                             let mut dirent_buffer = cell.borrow_mut();
                             *dirent_buffer = overlay_dirent;
@@ -1015,15 +1053,15 @@ pub unsafe extern "C" fn readdir64(dirp: *mut libc::DIR) -> *mut libc::dirent64 
     let overlay_dir_opt = map.get_mut(&DirPointer(dirp));
     if let Some(overlay_dir) = overlay_dir_opt {
         loop {
-            if let Some(overlay_ptr) = overlay_dir.overlay_dir_ptr {
+            for overlay_ptr in &overlay_dir.overlay_dir_ptrs {
                 let overlay_dirent64_ptr =
-                    unsafe { (get_original_functions().readdir64)(overlay_ptr) };
+                    unsafe { (get_original_functions().readdir64)(*overlay_ptr) };
                 if !overlay_dirent64_ptr.is_null() {
                     let overlay_dirent64 = unsafe { *overlay_dirent64_ptr };
                     let d_name_cstr = unsafe { CStr::from_ptr(overlay_dirent64.d_name.as_ptr()) };
                     let d_name_str = d_name_cstr.to_string_lossy().into_owned();
                     if d_name_str != "." && d_name_str != ".." {
-                        overlay_dir.seen_original_entries.insert(d_name_str);
+                        overlay_dir.seen_original_entries.insert(d_name_str.clone());
                         return DIRENT64_BUFFER.with(|cell| {
                             let mut dirent64_buffer = cell.borrow_mut();
                             *dirent64_buffer = overlay_dirent64;
@@ -1075,11 +1113,15 @@ pub unsafe extern "C" fn closedir(dirp: *mut libc::DIR) -> c_int {
         } else {
             0
         };
-        let overlay_res = if let Some(ptr) = overlay_dir.overlay_dir_ptr {
-            unsafe { (get_original_functions().closedir)(ptr) }
-        } else {
-            0
-        };
+        let mut overlay_res = 0;
+        for ptr in overlay_dir.overlay_dir_ptrs {
+            if !ptr.is_null() {
+                let res = unsafe { (get_original_functions().closedir)(ptr) };
+                if res != 0 {
+                    overlay_res = res;
+                }
+            }
+        }
         if original_res == 0 && overlay_res == 0 {
             if is_verbose_mode_enabled() {
                 eprintln!("[DEBUG] closedir: OVERLAY_DIR_MAP lock released (implicit).");
