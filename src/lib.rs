@@ -250,29 +250,66 @@ pub unsafe extern "C" fn statx(
     }
 
     let original_functions = get_original_functions();
-    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
-            let overlay_cstr = CString::new(overlay_path).unwrap();
-            if let Some(original_statx) = original_functions.statx {
-                return unsafe {
-                    original_statx(dirfd, overlay_cstr.as_ptr(), flags, mask, statxbuf)
-                };
-            } else {
-                unsafe {
-                    *__errno_location() = libc::ENOSYS;
+    if dirfd == libc::AT_FDCWD {
+        // absolute path
+        if let Some(original_statx) = original_functions.statx {
+            let original_result = unsafe { original_statx(dirfd, pathname, flags, mask, statxbuf) };
+            if original_result == 0 {
+                if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+                    let mode = unsafe { (*statxbuf).stx_mode };
+                    if (mode & (libc::S_IFMT as u16)) == (libc::S_IFREG as u16) {
+                        if let Some(overlay_path) = find_overlay_path(&path_str) {
+                            let overlay_cstr = CString::new(overlay_path).unwrap();
+                            return unsafe { original_statx(dirfd, overlay_cstr.as_ptr(), flags, mask, statxbuf) };
+                        }
+                    } else if (mode & (libc::S_IFMT as u16)) == (libc::S_IFDIR as u16) {
+                        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                            let overlay_cstr = CString::new(overlay_path).unwrap();
+                            return unsafe { original_statx(dirfd, overlay_cstr.as_ptr(), flags, mask, statxbuf) };
+                        }
+                    }
                 }
-                return -1;
+                return 0;
+            } else {
+                if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+                    if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                        let overlay_cstr = CString::new(overlay_path).unwrap();
+                        return unsafe { original_statx(dirfd, overlay_cstr.as_ptr(), flags, mask, statxbuf) };
+                    }
+                }
+                return original_result;
+            }
+        } else {
+            unsafe {
+                *__errno_location() = libc::ENOSYS;
+            }
+            return -1;
+        }
+    } else {
+        // relative path
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                if let Some(original_statx) = original_functions.statx {
+                    return unsafe {
+                        original_statx(dirfd, overlay_cstr.as_ptr(), flags, mask, statxbuf)
+                    };
+                } else {
+                    unsafe {
+                        *__errno_location() = libc::ENOSYS;
+                    }
+                    return -1;
+                }
             }
         }
-    }
-
-    if let Some(original_statx) = original_functions.statx {
-        unsafe { original_statx(dirfd, pathname, flags, mask, statxbuf) }
-    } else {
-        unsafe {
-            *__errno_location() = libc::ENOSYS;
+        if let Some(original_statx) = original_functions.statx {
+            unsafe { original_statx(dirfd, pathname, flags, mask, statxbuf) }
+        } else {
+            unsafe {
+                *__errno_location() = libc::ENOSYS;
+            }
+            -1
         }
-        -1
     }
 }
 
@@ -437,52 +474,148 @@ pub unsafe extern "C" fn fopen64(pathname: *const c_char, mode: *const c_char) -
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
-    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
-            let overlay_cstr = CString::new(overlay_path).unwrap();
-            return unsafe { (get_original_functions().stat)(overlay_cstr.as_ptr(), statbuf) };
-        }
+    if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.stat)(pathname, statbuf) };
     }
-    unsafe { (get_original_functions().stat)(pathname, statbuf) }
+    // First, try original stat
+    let original_result = unsafe { (get_original_functions().stat)(pathname, statbuf) };
+    if original_result == 0 {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            let mode = unsafe { (*statbuf).st_mode };
+            if (mode & libc::S_IFMT) == libc::S_IFREG {
+                if let Some(overlay_path) = find_overlay_path(&path_str) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().stat)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            } else if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().stat)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            }
+        }
+        return 0;
+    } else {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                return unsafe { (get_original_functions().stat)(overlay_cstr.as_ptr(), statbuf) };
+            }
+        }
+        return original_result;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
-    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
-            let overlay_cstr = CString::new(overlay_path).unwrap();
-            return unsafe { (get_original_functions().lstat)(overlay_cstr.as_ptr(), statbuf) };
-        }
+    if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.lstat)(pathname, statbuf) };
     }
-    unsafe { (get_original_functions().lstat)(pathname, statbuf) }
+    // First, try original lstat
+    let original_result = unsafe { (get_original_functions().lstat)(pathname, statbuf) };
+    if original_result == 0 {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            let mode = unsafe { (*statbuf).st_mode };
+            if (mode & libc::S_IFMT) == libc::S_IFREG {
+                if let Some(overlay_path) = find_overlay_path(&path_str) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().lstat)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            } else if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().lstat)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            }
+        }
+        return 0;
+    } else {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                return unsafe { (get_original_functions().lstat)(overlay_cstr.as_ptr(), statbuf) };
+            }
+        }
+        return original_result;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
-    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
-            let overlay_cstr = CString::new(overlay_path).unwrap();
-            return unsafe { (get_original_functions().stat64)(overlay_cstr.as_ptr(), statbuf) };
-        }
+    if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.stat64)(pathname, statbuf) };
     }
-    unsafe { (get_original_functions().stat64)(pathname, statbuf) }
+    // First, try original stat64
+    let original_result = unsafe { (get_original_functions().stat64)(pathname, statbuf) };
+    if original_result == 0 {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            let mode = unsafe { (*statbuf).st_mode };
+            if (mode & libc::S_IFMT) == libc::S_IFREG {
+                if let Some(overlay_path) = find_overlay_path(&path_str) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().stat64)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            } else if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().stat64)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            }
+        }
+        return 0;
+    } else {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                return unsafe { (get_original_functions().stat64)(overlay_cstr.as_ptr(), statbuf) };
+            }
+        }
+        return original_result;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
-    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
-            let overlay_cstr = CString::new(overlay_path).unwrap();
-            return unsafe { (get_original_functions().lstat64)(overlay_cstr.as_ptr(), statbuf) };
-        }
+    if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.lstat64)(pathname, statbuf) };
     }
-    unsafe { (get_original_functions().lstat64)(pathname, statbuf) }
+    // First, try original lstat64
+    let original_result = unsafe { (get_original_functions().lstat64)(pathname, statbuf) };
+    if original_result == 0 {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            let mode = unsafe { (*statbuf).st_mode };
+            if (mode & libc::S_IFMT) == libc::S_IFREG {
+                if let Some(overlay_path) = find_overlay_path(&path_str) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().lstat64)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            } else if (mode & libc::S_IFMT) == libc::S_IFDIR {
+                if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                    let overlay_cstr = CString::new(overlay_path).unwrap();
+                    return unsafe { (get_original_functions().lstat64)(overlay_cstr.as_ptr(), statbuf) };
+                }
+            }
+        }
+        return 0;
+    } else {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+                let overlay_cstr = CString::new(overlay_path).unwrap();
+                return unsafe { (get_original_functions().lstat64)(overlay_cstr.as_ptr(), statbuf) };
+            }
+        }
+        return original_result;
+    }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(pathname: *const c_char, mode: c_int) -> c_int {
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
-        if let Some(overlay_path) = find_overlay_path(&path_str).or_else(|| find_overlay_dir(&path_str)) {
+        if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
             return unsafe { (get_original_functions().access)(overlay_cstr.as_ptr(), mode) };
         }
