@@ -1066,14 +1066,12 @@ pub unsafe extern "C" fn readdir64(dirp: *mut libc::DIR) -> *mut libc::dirent64 
                     let overlay_dirent64 = unsafe { *overlay_dirent64_ptr };
                     let d_name_cstr = unsafe { CStr::from_ptr(overlay_dirent64.d_name.as_ptr()) };
                     let d_name_str = d_name_cstr.to_string_lossy().into_owned();
-                    if d_name_str != "." && d_name_str != ".." {
-                        overlay_dir.seen_original_entries.insert(d_name_str.clone());
-                        return DIRENT64_BUFFER.with(|cell| {
-                            let mut dirent64_buffer = cell.borrow_mut();
-                            *dirent64_buffer = overlay_dirent64;
-                            &mut *dirent64_buffer as *mut libc::dirent64
-                        });
-                    }
+                    overlay_dir.seen_original_entries.insert(d_name_str.clone());
+                    return DIRENT64_BUFFER.with(|cell| {
+                        let mut dirent64_buffer = cell.borrow_mut();
+                        *dirent64_buffer = overlay_dirent64;
+                        &mut *dirent64_buffer as *mut libc::dirent64
+                    });
                 }
             }
 
