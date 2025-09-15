@@ -963,26 +963,31 @@ pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut libc::DIR {
 
     let overlay_dir = OverlayDir {
         original_dir_ptr,
-        overlay_dir_ptrs,
+        overlay_dir_ptrs: overlay_dir_ptrs.clone(),
         seen_original_entries: HashSet::new(),
     };
 
     let overlay_dir_boxed = Box::new(overlay_dir);
     let overlay_dir_ptr_raw = Box::into_raw(overlay_dir_boxed);
+    let returned_ptr = if original_dir_ptr.is_null() && !overlay_dir_ptrs.is_empty() {
+        overlay_dir_ptrs[0]
+    } else {
+        original_dir_ptr
+    };
     if is_verbose_mode_enabled() {
         eprintln!("[DEBUG] opendir: acquiring OVERLAY_DIR_MAP lock...");
     }
     get_overlay_dir_map()
         .lock()
         .unwrap()
-        .insert(DirPointer(original_dir_ptr), unsafe {
+        .insert(DirPointer(returned_ptr), unsafe {
             Box::from_raw(overlay_dir_ptr_raw)
         });
     if is_verbose_mode_enabled() {
         eprintln!("[DEBUG] opendir: OVERLAY_DIR_MAP lock acquired and released.");
     }
 
-    original_dir_ptr
+    returned_ptr
 }
 
 #[unsafe(no_mangle)]
@@ -1003,17 +1008,18 @@ pub unsafe extern "C" fn readdir(dirp: *mut libc::DIR) -> *mut libc::dirent {
                     let overlay_dirent = unsafe { *overlay_dirent_ptr };
                     let d_name_cstr = unsafe { CStr::from_ptr(overlay_dirent.d_name.as_ptr()) };
                     let d_name_str = d_name_cstr.to_string_lossy().into_owned();
-                    if d_name_str != "." && d_name_str != ".." {
-                        overlay_dir.seen_original_entries.insert(d_name_str.clone());
-                        return DIRENT_BUFFER.with(|cell| {
-                            let mut dirent_buffer = cell.borrow_mut();
-                            *dirent_buffer = overlay_dirent;
-                            &mut *dirent_buffer as *mut libc::dirent
-                        });
-                    }
+                    overlay_dir.seen_original_entries.insert(d_name_str.clone());
+                    return DIRENT_BUFFER.with(|cell| {
+                        let mut dirent_buffer = cell.borrow_mut();
+                        *dirent_buffer = overlay_dirent;
+                        &mut *dirent_buffer as *mut libc::dirent
+                    });
                 }
             }
 
+            if overlay_dir.original_dir_ptr.is_null() {
+                return std::ptr::null_mut();
+            }
             let original_dirent_ptr =
                 unsafe { (get_original_functions().readdir)(overlay_dir.original_dir_ptr) };
             if !original_dirent_ptr.is_null() {
@@ -1071,6 +1077,9 @@ pub unsafe extern "C" fn readdir64(dirp: *mut libc::DIR) -> *mut libc::dirent64 
                 }
             }
 
+            if overlay_dir.original_dir_ptr.is_null() {
+                return std::ptr::null_mut();
+            }
             let original_dirent64_ptr =
                 unsafe { (get_original_functions().readdir64)(overlay_dir.original_dir_ptr) };
             if !original_dirent64_ptr.is_null() {
