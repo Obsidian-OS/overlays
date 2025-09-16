@@ -8,7 +8,7 @@ A Rust library designed to provide a file system overlay mechanism by intercepti
 
 - **Comprehensive Filesystem Interception:** Intercepts a wide range of filesystem-related system calls for redirection and overlaying. This includes:
     - **File Opening:** `open`, `open64`, `openat`, `openat64`, `fopen`, `fopen64`, `creat`, `creat64`
-    - **File Status:** `stat`, `lstat`, `stat64`, `lstat64`
+    - **File Status:** `stat`, `lstat`, `stat64`, `lstat64`, `statx`
     - **Access Control:** `access`, `faccessat`
     - **Symbolic Links:** `readlink`, `readlinkat`, `symlink`, `symlinkat`, `link`, `linkat`
     - **Execution:** `execve`, `execvp`, `execv`
@@ -16,9 +16,15 @@ A Rust library designed to provide a file system overlay mechanism by intercepti
     - **Permissions/Ownership:** `chmod`, `fchmodat`, `chown`, `fchownat`, `lchown`
     - **File Truncation:** `truncate`
 
-- **Directory Merging for `ls` and similar tools:** When `opendir` and `readdir` are intercepted, the library merges the contents of the original directory with its corresponding overlay directory. This means tools like `ls` will display files from both the original location and the overlay, with overlayed files taking precedence (shadowing original files with the same name).
+- **Directory Merging for `ls` and similar tools:** When `opendir` and `readdir` are intercepted, the library merges the contents of the original directory with its corresponding overlay directory. This means tools like `ls` will display files from both the original location and the overlay. Overlayed files with the same name will take precedence, effectively shadowing the original files.
 
 - **Configurable Overlays:** Overlay paths are configured via `/etc/obsidianos-overlays.conf`.
+
+- **Blacklisting:** Prevents specified paths from being overlaid. This is useful for protecting critical system directories or avoiding unintended behavior. Blacklisted paths will always resolve to their original location, bypassing any overlays.
+    - **Default Blacklist:** Includes essential system directories like `/dev`, `/sys`, `/proc`, `/tmp`, and `/run` to prevent system instability.
+    - **Configurable Blacklist:** Additional blacklist patterns can be defined in `/etc/obsidianos-overlays.blacklist`. This file supports glob-like patterns (e.g., `/usr/local/bin/*` or `*.log`) which are converted to regular expressions. Lines starting with `#` are treated as comments.
+
+
 
 ## Configuration
 

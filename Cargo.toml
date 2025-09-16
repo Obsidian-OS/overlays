@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 libc = "0.2.175"
+regex = "1"
 
 [lib]
 name = "obsidianos_overlays"

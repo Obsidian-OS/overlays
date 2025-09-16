@@ -1,6 +1,7 @@
 use libc::{
     __errno_location, FILE, c_char, c_int, c_uint, gid_t, mode_t, off_t, size_t, ssize_t, uid_t,
 };
+use regex::Regex;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -9,6 +10,34 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+struct Blacklist {
+    patterns: Vec<Regex>,
+}
+
+impl Blacklist {
+    fn new(patterns: Vec<Regex>) -> Self {
+        Blacklist { patterns }
+    }
+
+    fn is_blacklisted(&self, path: &str) -> bool {
+        if is_verbose_mode_enabled() {
+            eprintln!("[DEBUG] is_blacklisted: Checking path: {}", path);
+        }
+        for pattern in &self.patterns {
+            if pattern.is_match(path) {
+                if is_verbose_mode_enabled() {
+                    eprintln!("[DEBUG] is_blacklisted: Path {} matched by pattern {}", path, pattern);
+                }
+                return true;
+            }
+        }
+        if is_verbose_mode_enabled() {
+            eprintln!("[DEBUG] is_blacklisted: Path {} not blacklisted.", path);
+        }
+        false
+    }
+}
 thread_local! {
     static DIRENT_BUFFER: RefCell<libc::dirent> = RefCell::new(unsafe { std::mem::zeroed() });
 }
@@ -49,7 +78,8 @@ fn is_verbose_mode_enabled() -> bool {
     *VERBOSE_MODE
         .get_or_init(|| env::var("OBSIDIANOS_OVERLAYS_VERBOSE").map_or(false, |v| v == "1"))
 }
-static CONFIG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static OVERLAY_CONFIG: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static BLACKLIST: OnceLock<Mutex<Blacklist>> = OnceLock::new();
 static ORIG_FUNCS: OnceLock<OriginalFunctions> = OnceLock::new();
 static INIT_GUARD: AtomicBool = AtomicBool::new(false);
 struct OriginalFunctions {
@@ -101,7 +131,7 @@ struct OriginalFunctions {
     >,
 }
 
-fn load_config() -> Vec<String> {
+fn load_overlay_config() -> Vec<String> {
     if INIT_GUARD.load(Ordering::Relaxed) {
         return Vec::new();
     }
@@ -124,41 +154,125 @@ fn load_config() -> Vec<String> {
     result
 }
 
-fn get_overlays() -> Vec<String> {
-    if let Some(config_mutex) = CONFIG.get() {
+fn get_overlay_config() -> Vec<String> {
+    if let Some(config_mutex) = OVERLAY_CONFIG.get() {
         if is_verbose_mode_enabled() {
-            eprintln!("[DEBUG] get_overlays: CONFIG already initialized, acquiring lock...");
+            eprintln!("[DEBUG] get_overlay_config: OVERLAY_CONFIG already initialized, acquiring lock...");
         }
         let config_lock = config_mutex.lock().unwrap();
         if is_verbose_mode_enabled() {
-            eprintln!("[DEBUG] get_overlays: CONFIG lock acquired.");
+            eprintln!("[DEBUG] get_overlay_config: OVERLAY_CONFIG lock acquired.");
         }
         let overlays = config_lock.clone();
         if is_verbose_mode_enabled() {
-            eprintln!("[DEBUG] get_overlays: CONFIG lock released.");
+            eprintln!("[DEBUG] get_overlay_config: OVERLAY_CONFIG lock released.");
         }
         return overlays;
     }
 
     if is_verbose_mode_enabled() {
-        eprintln!("[DEBUG] get_overlays: CONFIG not initialized, loading config...");
+        eprintln!("[DEBUG] get_overlay_config: OVERLAY_CONFIG not initialized, loading config...");
     }
-    let loaded_config = load_config();
+    let loaded_config = load_overlay_config();
     if is_verbose_mode_enabled() {
-        eprintln!("[DEBUG] get_overlays: acquiring lock for initialization...");
+        eprintln!("[DEBUG] get_overlay_config: acquiring lock for initialization...");
     }
-    let config_mutex = CONFIG.get_or_init(|| Mutex::new(Vec::new()));
+    let config_mutex = OVERLAY_CONFIG.get_or_init(|| Mutex::new(Vec::new()));
     let mut config_lock = config_mutex.lock().unwrap();
     if is_verbose_mode_enabled() {
-        eprintln!("[DEBUG] get_overlays: lock acquired for initialization.");
+        eprintln!("[DEBUG] get_overlay_config: lock acquired for initialization.");
     }
     *config_lock = loaded_config;
     let overlays = config_lock.clone();
     if is_verbose_mode_enabled() {
-        eprintln!("[DEBUG] get_overlays: lock released after initialization.");
+        eprintln!("[DEBUG] get_overlay_config: lock released after initialization.");
     }
     overlays
 }
+
+fn load_blacklist() -> Blacklist {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        // If INIT_GUARD is already set, it means we are recursively calling load_blacklist
+        // This should not happen if the logic is correct, but as a safeguard, return empty.
+        eprintln!("[ERROR] Recursive call to load_blacklist detected. Returning empty blacklist.");
+        return Blacklist::new(Vec::new());
+    }
+    INIT_GUARD.store(true, Ordering::Relaxed);
+
+    if is_verbose_mode_enabled() {
+        eprintln!("[DEBUG] load_blacklist: Starting to load blacklist.");
+    }
+    let mut patterns = Vec::new();
+
+    // Default blacklist entries
+    let default_blacklist = vec![
+        "^/dev(/.*)?$",
+        "^/sys(/.*)?$",
+        "^/proc(/.*)?$",
+        "^/tmp(/.*)?$",
+        "^/run(/.*)?$",
+    ];
+
+    for pattern_str in default_blacklist {
+        if is_verbose_mode_enabled() {
+            eprintln!("[DEBUG] load_blacklist: Adding default pattern: {}", pattern_str);
+        }
+        match Regex::new(pattern_str) {
+            Ok(re) => patterns.push(re),
+            Err(e) => eprintln!("[ERROR] Failed to compile default blacklist regex '{}': {}", pattern_str, e),
+        }
+    }
+
+    // Load configurable blacklist entries
+    if is_verbose_mode_enabled() {
+        eprintln!("[DEBUG] load_blacklist: Attempting to read /etc/obsidianos-overlays.blacklist");
+    }
+    match fs::read_to_string("/etc/obsidianos-overlays.blacklist") {
+        Ok(content) => {
+            if is_verbose_mode_enabled() {
+                eprintln!("[DEBUG] load_blacklist: Successfully read /etc/obsidianos-overlays.blacklist");
+            }
+            for line in content.lines() {
+                let cleaned_line = line
+                    .split_once('#')
+                    .map_or(line, |(before_comment, _)| before_comment)
+                    .trim();
+                if !cleaned_line.is_empty() {
+                    if is_verbose_mode_enabled() {
+                        eprintln!("[DEBUG] load_blacklist: Adding custom pattern: {}", cleaned_line);
+                    }
+                    // Convert glob-like patterns to regex
+                    let regex_pattern = cleaned_line.replace(".", "\\.").replace("*", ".*");
+                    let final_pattern = if regex_pattern.starts_with('/') {
+                        format!("^/{}(/.*)?$", regex_pattern)
+                    } else {
+                        format!( ".*{}(/.*)?$", regex_pattern)
+                    };
+
+                    match Regex::new(&final_pattern) {
+                        Ok(re) => patterns.push(re),
+                        Err(e) => eprintln!("[ERROR] Failed to compile blacklist regex '{}': {}", cleaned_line, e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if is_verbose_mode_enabled() {
+                eprintln!("[DEBUG] No /etc/obsidianos-overlays.blacklist found or accessible: {}", e);
+            }
+        }
+    }
+    if is_verbose_mode_enabled() {
+        eprintln!("[DEBUG] load_blacklist: Finished loading blacklist.");
+    }
+    INIT_GUARD.store(false, Ordering::Relaxed);
+    Blacklist::new(patterns)
+}
+
+fn get_blacklist() -> &'static Mutex<Blacklist> {
+    BLACKLIST.get_or_init(|| Mutex::new(load_blacklist()))
+}
+
 
 fn get_original_functions() -> &'static OriginalFunctions {
     ORIG_FUNCS.get_or_init(|| unsafe {
@@ -239,6 +353,32 @@ pub unsafe extern "C" fn statx(
     mask: c_uint,
     statxbuf: *mut libc::statx,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        let original_functions = get_original_functions();
+        if let Some(original_statx) = original_functions.statx {
+            return unsafe { original_statx(dirfd, pathname, flags, mask, statxbuf) };
+        } else {
+            unsafe {
+                *__errno_location() = libc::ENOSYS;
+            }
+            return -1;
+        }
+    }
+
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            let original_functions = get_original_functions();
+            if let Some(original_statx) = original_functions.statx {
+                return unsafe { original_statx(dirfd, pathname, flags, mask, statxbuf) };
+            } else {
+                unsafe {
+                    *__errno_location() = libc::ENOSYS;
+                }
+                return -1;
+            }
+        }
+    }
+
     if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
         let original_functions = get_original_functions();
         if let Some(original_statx) = original_functions.statx {
@@ -320,7 +460,7 @@ fn find_overlay_path(path: &str) -> Option<String> {
         return None;
     }
 
-    let overlays = get_overlays();
+    let overlays = get_overlay_config();
     for overlay in overlays {
         let overlay_path = format!("{}{}", overlay, path);
         let is_file = OVERLAY_DISABLED.with(|disabled| {
@@ -351,7 +491,7 @@ fn find_overlay_dir(path: &str) -> Option<String> {
         return None;
     }
 
-    let overlays = get_overlays();
+    let overlays = get_overlay_config();
     for overlay in overlays {
         let overlay_path = format!("{}{}", overlay, path);
         let is_dir = OVERLAY_DISABLED.with(|disabled| {
@@ -390,6 +530,14 @@ unsafe fn cstr_to_string(ptr: *const c_char) -> Option<String> {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open(pathname: *const c_char, flags: c_int, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().open)(pathname, flags, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().open)(pathname, flags, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -401,6 +549,14 @@ pub unsafe extern "C" fn open(pathname: *const c_char, flags: c_int, mode: mode_
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn open64(pathname: *const c_char, flags: c_int, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().open64)(pathname, flags, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().open64)(pathname, flags, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -419,6 +575,16 @@ pub unsafe extern "C" fn openat(
     flags: c_int,
     mode: mode_t,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().openat)(dirfd, pathname, flags, mode) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().openat)(dirfd, pathname, flags, mode) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -439,6 +605,16 @@ pub unsafe extern "C" fn openat64(
     flags: c_int,
     mode: mode_t,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().openat64)(dirfd, pathname, flags, mode) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().openat64)(dirfd, pathname, flags, mode) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -454,6 +630,14 @@ pub unsafe extern "C" fn openat64(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fopen(pathname: *const c_char, mode: *const c_char) -> *mut FILE {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().fopen)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().fopen)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -465,6 +649,14 @@ pub unsafe extern "C" fn fopen(pathname: *const c_char, mode: *const c_char) -> 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fopen64(pathname: *const c_char, mode: *const c_char) -> *mut FILE {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().fopen64)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().fopen64)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -476,6 +668,15 @@ pub unsafe extern "C" fn fopen64(pathname: *const c_char, mode: *const c_char) -
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.stat)(pathname, statbuf) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().stat)(pathname, statbuf) };
+        }
+    }
     if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
         let original_functions = get_original_functions();
         return unsafe { (original_functions.stat)(pathname, statbuf) };
@@ -511,6 +712,15 @@ pub unsafe extern "C" fn stat(pathname: *const c_char, statbuf: *mut libc::stat)
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat(pathname: *const c_char, statbuf: *mut libc::stat) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.lstat)(pathname, statbuf) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().lstat)(pathname, statbuf) };
+        }
+    }
     if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
         let original_functions = get_original_functions();
         return unsafe { (original_functions.lstat)(pathname, statbuf) };
@@ -546,6 +756,15 @@ pub unsafe extern "C" fn lstat(pathname: *const c_char, statbuf: *mut libc::stat
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn stat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.stat64)(pathname, statbuf) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().stat64)(pathname, statbuf) };
+        }
+    }
     if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
         let original_functions = get_original_functions();
         return unsafe { (original_functions.stat64)(pathname, statbuf) };
@@ -581,6 +800,15 @@ pub unsafe extern "C" fn stat64(pathname: *const c_char, statbuf: *mut libc::sta
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lstat64(pathname: *const c_char, statbuf: *mut libc::stat64) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        let original_functions = get_original_functions();
+        return unsafe { (original_functions.lstat64)(pathname, statbuf) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().lstat64)(pathname, statbuf) };
+        }
+    }
     if OVERLAY_DISABLED.with(|disabled| *disabled.borrow()) {
         let original_functions = get_original_functions();
         return unsafe { (original_functions.lstat64)(pathname, statbuf) };
@@ -621,6 +849,16 @@ pub unsafe extern "C" fn fstatat(
     statbuf: *mut libc::stat,
     flags: c_int,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().fstatat)(dirfd, pathname, statbuf, flags) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().fstatat)(dirfd, pathname, statbuf, flags) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -636,6 +874,14 @@ pub unsafe extern "C" fn fstatat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn access(pathname: *const c_char, mode: c_int) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().access)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().access)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -652,6 +898,16 @@ pub unsafe extern "C" fn faccessat(
     mode: c_int,
     flags: c_int,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().faccessat)(dirfd, pathname, mode, flags) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().faccessat)(dirfd, pathname, mode, flags) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -671,6 +927,14 @@ pub unsafe extern "C" fn readlink(
     buf: *mut c_char,
     bufsiz: size_t,
 ) -> ssize_t {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().readlink)(pathname, buf, bufsiz) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().readlink)(pathname, buf, bufsiz) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -689,6 +953,16 @@ pub unsafe extern "C" fn readlinkat(
     buf: *mut c_char,
     bufsiz: size_t,
 ) -> ssize_t {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().readlinkat)(dirfd, pathname, buf, bufsiz) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().readlinkat)(dirfd, pathname, buf, bufsiz) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -708,6 +982,14 @@ pub unsafe extern "C" fn execve(
     argv: *const *const c_char,
     envp: *const *const c_char,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().execve)(pathname, argv, envp) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().execve)(pathname, argv, envp) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -719,6 +1001,14 @@ pub unsafe extern "C" fn execve(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().execvp)(file, argv) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(file) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().execvp)(file, argv) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(file) } {
         if path_str.starts_with('/') {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -732,6 +1022,14 @@ pub unsafe extern "C" fn execvp(file: *const c_char, argv: *const *const c_char)
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn execv(pathname: *const c_char, argv: *const *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().execv)(pathname, argv) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().execv)(pathname, argv) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -743,6 +1041,14 @@ pub unsafe extern "C" fn execv(pathname: *const c_char, argv: *const *const c_ch
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().unlink)(pathname) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().unlink)(pathname) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -754,6 +1060,16 @@ pub unsafe extern "C" fn unlink(pathname: *const c_char) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: c_int) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().unlinkat)(dirfd, pathname, flags) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().unlinkat)(dirfd, pathname, flags) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -769,6 +1085,14 @@ pub unsafe extern "C" fn unlinkat(dirfd: c_int, pathname: *const c_char, flags: 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rmdir(pathname: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().rmdir)(pathname) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().rmdir)(pathname) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -780,6 +1104,14 @@ pub unsafe extern "C" fn rmdir(pathname: *const c_char) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdir(pathname: *const c_char, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().mkdir)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().mkdir)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -791,6 +1123,16 @@ pub unsafe extern "C" fn mkdir(pathname: *const c_char, mode: mode_t) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().mkdirat)(dirfd, pathname, mode) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().mkdirat)(dirfd, pathname, mode) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -806,6 +1148,19 @@ pub unsafe extern "C" fn mkdirat(dirfd: c_int, pathname: *const c_char, mode: mo
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rename(oldpath: *const c_char, newpath: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().rename)(oldpath, newpath) };
+    }
+    if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&oldpath_str) {
+            return unsafe { (get_original_functions().rename)(oldpath, newpath) };
+        }
+    }
+    if let Some(newpath_str) = unsafe { cstr_to_string(newpath) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&newpath_str) {
+            return unsafe { (get_original_functions().rename)(oldpath, newpath) };
+        }
+    }
     if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
         if let Some(overlay_oldpath) = find_overlay_path(&oldpath_str) {
             let overlay_old_cstr = CString::new(overlay_oldpath).unwrap();
@@ -832,6 +1187,21 @@ pub unsafe extern "C" fn renameat(
     newdirfd: c_int,
     newpath: *const c_char,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().renameat)(olddirfd, oldpath, newdirfd, newpath) };
+    }
+    if olddirfd == libc::AT_FDCWD && newdirfd == libc::AT_FDCWD {
+        if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&oldpath_str) {
+                return unsafe { (get_original_functions().renameat)(olddirfd, oldpath, newdirfd, newpath) };
+            }
+        }
+        if let Some(newpath_str) = unsafe { cstr_to_string(newpath) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&newpath_str) {
+                return unsafe { (get_original_functions().renameat)(olddirfd, oldpath, newdirfd, newpath) };
+            }
+        }
+    }
     if olddirfd == libc::AT_FDCWD && newdirfd == libc::AT_FDCWD {
         if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
             if let Some(overlay_oldpath) = find_overlay_path(&oldpath_str) {
@@ -857,6 +1227,14 @@ pub unsafe extern "C" fn renameat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat(pathname: *const c_char, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().creat)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().creat)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -868,6 +1246,14 @@ pub unsafe extern "C" fn creat(pathname: *const c_char, mode: mode_t) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat64(pathname: *const c_char, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().creat64)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().creat64)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -879,6 +1265,14 @@ pub unsafe extern "C" fn creat64(pathname: *const c_char, mode: mode_t) -> c_int
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().chdir)(path) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(path) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().chdir)(path) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(path) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -890,6 +1284,14 @@ pub unsafe extern "C" fn chdir(path: *const c_char) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chmod(pathname: *const c_char, mode: mode_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().chmod)(pathname, mode) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().chmod)(pathname, mode) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -906,6 +1308,16 @@ pub unsafe extern "C" fn fchmodat(
     mode: mode_t,
     flags: c_int,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().fchmodat)(dirfd, pathname, mode, flags) };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe { (get_original_functions().fchmodat)(dirfd, pathname, mode, flags) };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -921,6 +1333,14 @@ pub unsafe extern "C" fn fchmodat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn chown(pathname: *const c_char, owner: uid_t, group: gid_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().chown)(pathname, owner, group) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().chown)(pathname, owner, group) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -940,6 +1360,32 @@ pub unsafe extern "C" fn fchownat(
     group: gid_t,
     flags: c_int,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe {
+            (get_original_functions().fchownat)(
+                dirfd,
+                pathname,
+                owner,
+                group,
+                flags,
+            )
+        };
+    }
+    if dirfd == libc::AT_FDCWD {
+        if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+                return unsafe {
+                    (get_original_functions().fchownat)(
+                        dirfd,
+                        pathname,
+                        owner,
+                        group,
+                        flags,
+                    )
+                };
+            }
+        }
+    }
     if dirfd == libc::AT_FDCWD {
         if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
             if let Some(overlay_path) = find_overlay_path(&path_str) {
@@ -961,6 +1407,14 @@ pub unsafe extern "C" fn fchownat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lchown(pathname: *const c_char, owner: uid_t, group: gid_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().lchown)(pathname, owner, group) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().lchown)(pathname, owner, group) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(pathname) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -974,6 +1428,19 @@ pub unsafe extern "C" fn lchown(pathname: *const c_char, owner: uid_t, group: gi
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn link(oldpath: *const c_char, newpath: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().link)(oldpath, newpath) };
+    }
+    if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&oldpath_str) {
+            return unsafe { (get_original_functions().link)(oldpath, newpath) };
+        }
+    }
+    if let Some(newpath_str) = unsafe { cstr_to_string(newpath) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&newpath_str) {
+            return unsafe { (get_original_functions().link)(oldpath, newpath) };
+        }
+    }
     if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
         if let Some(overlay_oldpath) = find_overlay_path(&oldpath_str) {
             let overlay_old_cstr = CString::new(overlay_oldpath).unwrap();
@@ -1001,6 +1468,21 @@ pub unsafe extern "C" fn linkat(
     newpath: *const c_char,
     flags: c_int,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().linkat)(olddirfd, oldpath, newdirfd, newpath, flags) };
+    }
+    if olddirfd == libc::AT_FDCWD && newdirfd == libc::AT_FDCWD {
+        if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&oldpath_str) {
+                return unsafe { (get_original_functions().linkat)(olddirfd, oldpath, newdirfd, newpath, flags) };
+            }
+        }
+        if let Some(newpath_str) = unsafe { cstr_to_string(newpath) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&newpath_str) {
+                return unsafe { (get_original_functions().linkat)(olddirfd, oldpath, newdirfd, newpath, flags) };
+            }
+        }
+    }
     if olddirfd == libc::AT_FDCWD && newdirfd == libc::AT_FDCWD {
         if let Some(oldpath_str) = unsafe { cstr_to_string(oldpath) } {
             if let Some(overlay_oldpath) = find_overlay_path(&oldpath_str) {
@@ -1027,6 +1509,19 @@ pub unsafe extern "C" fn linkat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn symlink(target: *const c_char, linkpath: *const c_char) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().symlink)(target, linkpath) };
+    }
+    if let Some(target_str) = unsafe { cstr_to_string(target) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&target_str) {
+            return unsafe { (get_original_functions().symlink)(target, linkpath) };
+        }
+    }
+    if let Some(linkpath_str) = unsafe { cstr_to_string(linkpath) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&linkpath_str) {
+            return unsafe { (get_original_functions().symlink)(target, linkpath) };
+        }
+    }
     if let Some(target_str) = unsafe { cstr_to_string(target) } {
         if let Some(overlay_target) = find_overlay_path(&target_str) {
             let overlay_target_cstr = CString::new(overlay_target).unwrap();
@@ -1052,6 +1547,21 @@ pub unsafe extern "C" fn symlinkat(
     newdirfd: c_int,
     linkpath: *const c_char,
 ) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().symlinkat)(target, newdirfd, linkpath) };
+    }
+    if newdirfd == libc::AT_FDCWD {
+        if let Some(target_str) = unsafe { cstr_to_string(target) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&target_str) {
+                return unsafe { (get_original_functions().symlinkat)(target, newdirfd, linkpath) };
+            }
+        }
+        if let Some(linkpath_str) = unsafe { cstr_to_string(linkpath) } {
+            if get_blacklist().lock().unwrap().is_blacklisted(&linkpath_str) {
+                return unsafe { (get_original_functions().symlinkat)(target, newdirfd, linkpath) };
+            }
+        }
+    }
     if newdirfd == libc::AT_FDCWD {
         if let Some(target_str) = unsafe { cstr_to_string(target) } {
             if let Some(overlay_target) = find_overlay_path(&target_str) {
@@ -1076,6 +1586,14 @@ pub unsafe extern "C" fn symlinkat(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn truncate(path: *const c_char, length: off_t) -> c_int {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().truncate)(path, length) };
+    }
+    if let Some(path_str) = unsafe { cstr_to_string(path) } {
+        if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+            return unsafe { (get_original_functions().truncate)(path, length) };
+        }
+    }
     if let Some(path_str) = unsafe { cstr_to_string(path) } {
         if let Some(overlay_path) = find_overlay_path(&path_str) {
             let overlay_cstr = CString::new(overlay_path).unwrap();
@@ -1087,14 +1605,21 @@ pub unsafe extern "C" fn truncate(path: *const c_char, length: off_t) -> c_int {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn opendir(name: *const c_char) -> *mut libc::DIR {
+    if INIT_GUARD.load(Ordering::Relaxed) {
+        return unsafe { (get_original_functions().opendir)(name) };
+    }
     let path_str = match unsafe { cstr_to_string(name) } {
         Some(s) => s,
         None => return unsafe { (get_original_functions().opendir)(name) },
     };
 
+    if get_blacklist().lock().unwrap().is_blacklisted(&path_str) {
+        return unsafe { (get_original_functions().opendir)(name) };
+    }
+
     let original_dir_ptr = unsafe { (get_original_functions().opendir)(name) };
     let mut overlay_dir_ptrs = Vec::new();
-    let overlays = get_overlays();
+    let overlays = get_overlay_config();
     for overlay in overlays {
         let overlay_path = format!("{}{}", overlay, path_str);
         let is_dir = OVERLAY_DISABLED.with(|disabled| {
